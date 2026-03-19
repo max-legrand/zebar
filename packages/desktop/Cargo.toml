@@ -54,6 +54,7 @@ windows = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
+objc = "0.2"
 komorebi-util = { path = "../../crates/komorebi-util" }
 
 [features]

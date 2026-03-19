@@ -7839,6 +7839,7 @@ dependencies = [
  "globset",
  "komorebi-util",
  "netdev",
+ "objc",
  "regex",
  "reqwest 0.12.28",
  "rocket",

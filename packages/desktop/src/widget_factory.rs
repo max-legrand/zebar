@@ -378,6 +378,15 @@ impl WidgetFactory {
         .window()
         .set_tool_window(!widget_config.shown_in_taskbar);
 
+      // Force the window onto the screen on macOS. Tauri's default
+      // `visible(true)` calls `orderFront:` which is a no-op when the
+      // app isn't active — so widgets re-created after sleep/wake
+      // while another app has focus would load but never draw.
+      #[cfg(target_os = "macos")]
+      if let Err(err) = window.as_ref().window().show_regardless() {
+        error!("Failed to order widget window front: {:?}", err);
+      }
+
       // Store the underlying window handle (Windows only).
       #[cfg(target_os = "windows")]
       {
@@ -570,6 +579,113 @@ impl WidgetFactory {
 
       Ok((final_size, final_position))
     }
+  }
+
+  /// Brings any still-alive widget windows forward and recreates the
+  /// ones that were destroyed.
+  ///
+  /// On a session event (sleep/wake/unlock) we don't know whether the
+  /// OS actually tore down our windows. For display-sleep the windows
+  /// are still alive and a full stop+start makes them blink out; for a
+  /// real lock the OS may have destroyed them and we need to relaunch.
+  /// This method handles both.
+  pub async fn restore(&self) -> anyhow::Result<()> {
+    let tracked: Vec<WidgetState> = {
+      self.widget_states.lock().await.values().cloned().collect()
+    };
+
+    // Windows can keep the Tauri window alive across sleep while losing
+    // the native appbar/topmost/taskbar state. Recreate all tracked
+    // widgets so docked bars re-register their appbar reservations and
+    // get placed back above the taskbar reliably after resume.
+    #[cfg(target_os = "windows")]
+    {
+      let tracked_ids = tracked
+        .iter()
+        .map(|state| state.id.clone())
+        .collect::<Vec<_>>();
+
+      if !tracked_ids.is_empty() {
+        info!(
+          "Restoring {} widget(s) after Windows resume.",
+          tracked_ids.len()
+        );
+        self.relaunch_by_ids(&tracked_ids).await?;
+      }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+      let mut destroyed_ids = vec![];
+
+      for state in &tracked {
+        match self.app_handle.get_webview_window(&state.id) {
+          Some(window) => {
+            // Window survived — make sure it's visible.
+            #[cfg(target_os = "macos")]
+            if let Err(err) = window.as_ref().window().show_regardless() {
+              error!("Failed to show widget {}: {:?}", state.id, err);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = window;
+          }
+          None => destroyed_ids.push(state.id.clone()),
+        }
+      }
+
+      if !destroyed_ids.is_empty() {
+        info!(
+          "Restoring {} widget(s) destroyed during sleep/lock.",
+          destroyed_ids.len()
+        );
+        self.relaunch_by_ids(&destroyed_ids).await?;
+      }
+    }
+
+    // Launch any startup widgets that aren't currently running (e.g.
+    // a fresh launch path through the same restore call).
+    let running_pack_widget_preset: Vec<(String, String, String)> = {
+      self
+        .widget_states
+        .lock()
+        .await
+        .values()
+        .filter_map(|state| match &state.open_options {
+          WidgetOpenOptions::Preset(name) => Some((
+            state.pack_id.clone(),
+            state.name.clone(),
+            name.clone(),
+          )),
+          _ => None,
+        })
+        .collect()
+    };
+
+    for cfg in self.app_settings.startup_configs().await {
+      let already_running =
+        running_pack_widget_preset.iter().any(|(p, w, pr)| {
+          *p == cfg.pack && *w == cfg.widget && *pr == cfg.preset
+        });
+
+      if already_running {
+        continue;
+      }
+
+      if let Err(err) = self
+        .start_widget_by_id(
+          &cfg.pack,
+          &cfg.widget,
+          &WidgetOpenOptions::Preset(cfg.preset),
+          false,
+        )
+        .await
+      {
+        error!("Failed to start missing startup widget: {:?}", err);
+      }
+    }
+
+    Ok(())
   }
 
   /// Opens presets that are configured to be launched on startup.
@@ -790,6 +906,36 @@ impl WidgetFactory {
     }
 
     Ok(())
+  }
+
+  /// Stops all widgets and clears tracked state.
+  ///
+  /// This is used during session restore to ensure a clean slate
+  /// before re-launching startup widgets. Any windows that were
+  /// already destroyed by the OS are silently ignored.
+  pub async fn stop_all(&self) {
+    let widget_ids: Vec<String> =
+      { self.widget_states.lock().await.keys().cloned().collect() };
+
+    // Clear all tracked state first to avoid race conditions with
+    // the Destroyed event handler.
+    {
+      let mut widget_states = self.widget_states.lock().await;
+
+      #[cfg(target_os = "windows")]
+      for state in widget_states.values() {
+        if let Some(window_handle) = state.window_handle {
+          let _ = remove_app_bar(window_handle);
+        }
+      }
+
+      widget_states.clear();
+    }
+
+    // Try to close any windows that are still alive.
+    for widget_id in &widget_ids {
+      let _ = self.stop_by_id(widget_id);
+    }
   }
 
   /// Relaunches all currently open widgets.

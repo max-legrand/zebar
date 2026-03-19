@@ -238,6 +238,18 @@ async fn start_app(app: &mut tauri::App, cli: Cli) -> anyhow::Result<()> {
   )
   .await?;
 
+  // Start listening for session lock/unlock and sleep/resume events.
+  let session_listener = {
+    use crate::common::SessionListener;
+    match SessionListener::new() {
+      Ok(listener) => Some(listener),
+      Err(err) => {
+        error!("Failed to start session listener: {:?}", err);
+        None
+      }
+    }
+  };
+
   listen_events(
     app.handle(),
     app_settings,
@@ -248,6 +260,7 @@ async fn start_app(app: &mut tauri::App, cli: Cli) -> anyhow::Result<()> {
     manager,
     emit_rx,
     install_rx,
+    session_listener,
   );
 
   // Placeholder window to keep the process running when all windows are
@@ -269,6 +282,7 @@ fn listen_events(
   manager: Arc<ProviderManager>,
   mut emit_rx: mpsc::UnboundedReceiver<ProviderEmission>,
   mut install_rx: mpsc::Receiver<WidgetPack>,
+  mut session_listener: Option<crate::common::SessionListener>,
 ) {
   let app_handle = app_handle.clone();
   let mut widget_open_rx = widget_factory.open_tx.subscribe();
@@ -322,6 +336,64 @@ fn listen_events(
         Some(pack) = install_rx.recv() => {
           info!("Widget pack installed: {:?}", pack);
           widget_pack_manager.register_widget_pack(pack).await;
+          Ok(())
+        },
+        // Restore widgets when the session is unlocked or the system
+        // resumes from sleep. Widgets may have been destroyed by the
+        // OS during the lock, which removes them from `widget_states`.
+        //
+        // macOS fires several notifications across a single wake/unlock
+        // (e.g. `ScreensDidWake`, then `screenIsUnlocked` after the
+        // user types their password seconds later). We debounce by
+        // waiting for a quiet period — no further events for 2s —
+        // before restoring, so a delayed unlock doesn't trigger a
+        // second stop/restart cycle that races with the windows we
+        // just brought back.
+        Some(_event) = async {
+          if let Some(ref mut listener) = session_listener {
+            listener.next_event().await
+          } else {
+            std::future::pending().await
+          }
+        } => {
+          info!("Session event received.");
+
+          // Fast path: immediately bring any still-alive widget
+          // windows to the front. Covers display-sleep / quick wake
+          // where the OS hasn't destroyed our windows.
+          for state in widget_factory.states().await.values() {
+            if let Some(window) = app_handle.get_webview_window(&state.id) {
+              #[cfg(target_os = "macos")]
+              {
+                use crate::common::macos::WindowExtMacOs;
+                let _ = window.as_ref().window().show_regardless();
+              }
+              #[cfg(not(target_os = "macos"))]
+              let _ = window;
+            }
+          }
+
+          // Debounce: wait for additional session events to stop
+          // firing (e.g. delayed `screenIsUnlocked` after password),
+          // then run the full restore to relaunch any widgets the OS
+          // destroyed and start any missing startup widgets.
+          if let Some(ref mut listener) = session_listener {
+            loop {
+              tokio::select! {
+                Some(_) = listener.next_event() => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => break,
+              }
+            }
+          } else {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+          }
+
+          info!("Session events settled, finalizing restore.");
+
+          if let Err(err) = widget_factory.restore().await {
+            error!("Failed to restore widgets: {:?}", err);
+          }
+
           Ok(())
         },
       };
